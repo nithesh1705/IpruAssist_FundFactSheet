@@ -68,4 +68,4 @@ python main.py --file "Documents/<filename>.pdf"
 - Requires active OpenAI API account with sufficient credits
 - Works best with clearly formatted factsheets
 
-## Made of ICICI Pru AMC
+## Made for ICICI Pru AMC
