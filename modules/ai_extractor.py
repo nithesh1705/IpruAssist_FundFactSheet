@@ -177,21 +177,28 @@ def extract_fund_names(
     """
     system_prompt = (
         "You are a financial document parser specializing in mutual fund fact sheets. "
-        "Your ONLY job is to identify distinct mutual fund SCHEME names that are LITERALLY PRESENT "
-        "in the provided pages. "
+        "Your ONLY job is to identify distinct mutual fund SCHEME names that have a DEDICATED FACT SHEET SECTION "
+        "in the provided pages — meaning a section that shows that fund's own NAV, AUM, returns table, "
+        "and/or portfolio holdings. "
         "\n\nCRITICAL ACCURACY RULES:"
-        "\n1. ONLY extract names that are ACTUALLY printed on these pages. DO NOT guess or invent names."
+        "\n1. ONLY include a fund if it has its OWN dedicated section in these pages. "
+        "   DO NOT include funds that are merely MENTIONED in passing (e.g. in disclaimers, footnotes, "
+        "   SID references, benchmark comparisons, Scheme Information Documents, or 'other funds offered by' lists)."
         "\n2. DO NOT list plan variants as separate funds! "
         "   Examples to IGNORE: '- Direct Plan', '- Regular Plan', '- Growth', '- IDCW', "
         "   '- Investment Plan', '- Savings Plan'. These are options WITHIN a fund."
         "\n3. Extract only the EXACT ROOT scheme name. For example if you see 'SBI Children\\'s Fund - Investment Plan', "
         "   extract ONLY 'SBI Children\\'s Fund'."
-        "\n4. Ignore AMC names, section headers, table column labels, and footer text."
+        "\n4. Ignore AMC names, section headers, table column labels, footer text, and fund names that only "
+        "   appear in disclaimer/legal/reference sections."
         "\n5. If embedded PDF text is provided, use it as the primary source for exact spelling."
         "\nReturn ONLY a JSON object with a single key 'data' containing an array of scheme name strings."
     )
     user_prefix = (
-        "From these pages, list every distinct mutual fund SCHEME name that is literally printed here. "
+        "From these pages, identify every mutual fund SCHEME that has a DEDICATED FACT SHEET SECTION here. "
+        "A dedicated section means the page actually displays that fund's own NAV, AUM, returns, or portfolio data. "
+        "Do NOT include funds that only appear in disclaimers, footnotes, SID references, benchmark names, "
+        "or sentences like 'units of Sundaram Liquid Fund may be used for...'. "
         "Use the EMBEDDED PDF TEXT (if shown) for exact spelling of fund names. "
         "Strip ANY plan suffixes (like - Direct/Regular/Growth/IDCW/Savings Plan/Investment Plan) — return ONLY the base scheme name. "
         "Return ONLY a JSON object: {\"data\": [\"Scheme Name 1\", \"Scheme Name 2\"]}. "
@@ -318,7 +325,7 @@ def _index_page_lookup(fund_name: str, page_texts: list[str]) -> list[int]:
       - 'Tata Large & Mid Cap Fund' does NOT match 'Tata Large Cap Fund'
       - 'Tata Nifty Midcap 150 ...' does NOT match 'Tata Mid Cap Fund'
 
-    Also handles page ranges like '65 - 66' -> takes the first (start) page.
+    Also handles page ranges like '65 - 66' -> captures ALL pages in the range.
     Returns a list of 0-based page indices, or [] if not found.
     """
     words = re.findall(r'[\w&]+', fund_name, re.IGNORECASE)
@@ -328,19 +335,27 @@ def _index_page_lookup(fund_name: str, page_texts: list[str]) -> list[int]:
     name_pattern = r'.*?'.join(re.escape(w) for w in words)
 
     # Format A: fund name AND page number on the same line
-    same_line_re = re.compile(rf'(?i){name_pattern}.*?\b(\d{{1,3}})\b')
+    # Now captures optional range end: '22' or '65 - 66'
+    same_line_re = re.compile(rf'(?i){name_pattern}.*?\b(\d{{1,3}})\s*(?:-\s*(\d{{1,3}}))?\b')
 
     # Format B step 1: quick pre-filter — line must contain the fund name words at all
     name_only_re = re.compile(rf'(?i){name_pattern}')
 
-    # Format B step 2: standalone number line e.g. '22' or '65 - 66'
-    standalone_num_re = re.compile(r'^\s*(\d{1,3})\s*(?:-\s*\d{1,3})?\s*$')
+    # Format B step 2: standalone number / range line e.g. '22' or '65 - 66'
+    standalone_num_re = re.compile(r'^\s*(\d{1,3})\s*(?:-\s*(\d{1,3}))?\s*$')
 
     found_pages: set[int] = set()
     index_texts = page_texts[:INDEX_SCAN_PAGES]
 
     def _is_valid_page(n: int) -> bool:
         return INDEX_SCAN_PAGES < n <= len(page_texts)
+
+    def _add_range(start: int, end: int | None) -> None:
+        """Add all 0-based indices in the page range [start, end] that are valid."""
+        stop = end if (end and end >= start) else start
+        for pg in range(start, stop + 1):
+            if _is_valid_page(pg):
+                found_pages.add(pg - 1)
 
     def _normalize(s: str) -> str:
         """Lowercase, strip special chars/punctuation, collapse whitespace."""
@@ -355,23 +370,23 @@ def _index_page_lookup(fund_name: str, page_texts: list[str]) -> list[int]:
             if not line:
                 continue
 
-            # ── Format A: name + page number on the same line ────────────────
+            # ── Format A: name + page number (+ optional range end) on same line ──
             m = same_line_re.search(line)
             if m:
-                candidate = int(m.group(1))
-                if _is_valid_page(candidate):
-                    found_pages.add(candidate - 1)
+                start_pg = int(m.group(1))
+                end_pg = int(m.group(2)) if m.group(2) else None
+                _add_range(start_pg, end_pg)
                 continue
 
-            # ── Format B: name on line N, number on line N+K ─────────────────
+            # ── Format B: name on line N, number/range on line N+K ────────────
             if name_only_re.search(line) and _normalize(fund_name) == _normalize(line):
                 for lookahead_idx in range(i + 1, min(i + 4, len(lines))):
                     next_line = lines[lookahead_idx]
                     m_num = standalone_num_re.match(next_line)
                     if m_num:
-                        candidate = int(m_num.group(1))
-                        if _is_valid_page(candidate):
-                            found_pages.add(candidate - 1)
+                        start_pg = int(m_num.group(1))
+                        end_pg = int(m_num.group(2)) if m_num.group(2) else None
+                        _add_range(start_pg, end_pg)
                         break  # number found, stop lookahead
 
     return sorted(found_pages)
@@ -387,12 +402,14 @@ def _text_only_gpt_lookup(
     Tier-2 (Text-only, gpt-4o-mini, NO images): Ask GPT which of the candidate pages
     contain the dedicated fact sheet section — using only the embedded text layer.
     Much faster and cheaper than vision; typically 1 API call for up to 30 pages.
+    A fund's section may span MULTIPLE consecutive pages — all of them are returned.
     """
     system_prompt = (
         "You are a document navigation assistant for mutual fund fact sheets. "
-        "Given embedded text from candidate pages, identify which page numbers contain "
-        "the DEDICATED fact sheet section for the named fund — meaning the page that shows "
-        "this fund's own NAV, AUM, returns table, portfolio holdings. "
+        "Given embedded text from candidate pages, identify ALL page numbers that belong to "
+        "the DEDICATED fact sheet section for the named fund. "
+        "A fund's fact sheet section often spans 2 or even 3 consecutive pages — include EVERY page "
+        "that contains this fund's own NAV, AUM, returns table, portfolio holdings, or sector breakdown. "
         "A page that only lists the fund in an index, disclaimer, or footer does NOT qualify. "
         "Return ONLY a JSON object with a single key 'data' containing an array of 1-based page numbers (integers)."
     )
@@ -412,8 +429,10 @@ def _text_only_gpt_lookup(
             "type": "text",
             "text": (
                 f"Which of these pages contain the DEDICATED fact sheet section for: '{fund_name}'?\n"
-                f"The dedicated page shows this fund's NAV, AUM, returns, portfolio — not just a mention.\n"
-                f"Return ONLY a JSON object: {{\"data\": [22]}}. If none, return {{\"data\": []}}.\n\n"
+                f"IMPORTANT: A fund section can span MULTIPLE consecutive pages (e.g. page 22 AND 23). "
+                f"Return ALL pages that are part of this fund's dedicated section (NAV, AUM, returns, portfolio, sector breakdown).\n"
+                f"Do NOT include pages that only mention the fund in an index or footer.\n"
+                f"Return ONLY a JSON object: {{\"data\": [22, 23]}}. If none, return {{\"data\": []}}.\n\n"
                 f"{combined}"
             )
         }
@@ -456,8 +475,29 @@ def find_fund_pages(
         console.print(f"[cyan]  ℹ [Tier 1] Scanning Index/TOC for '{fund_name}'...[/cyan]")
         index_pages = _index_page_lookup(fund_name, page_texts)
         if index_pages:
-            console.print(f"[green]  ✔ [Tier 1] Index lookup found page(s): {[p + 1 for p in index_pages]} (0 API calls)[/green]")
-            return index_pages
+            # Expand: also include immediately following pages that still contain
+            # the fund name, to catch multi-page fund sections the TOC doesn't enumerate.
+            expanded = set(index_pages)
+            for start_p in index_pages:
+                for offset in range(1, 4):          # check up to 3 continuation pages
+                    next_p = start_p + offset
+                    if next_p >= len(page_texts):
+                        break
+                    next_text = page_texts[next_p].lower()
+                    fund_norm = re.sub(r'\s+', ' ', fund_name.lower()).strip()
+                    if fund_norm in next_text:
+                        expanded.add(next_p)
+                    else:
+                        break                       # stop at first page that no longer has the fund
+            expanded_sorted = sorted(expanded)
+            if len(expanded_sorted) > len(index_pages):
+                console.print(
+                    f"[green]  ✔ [Tier 1] Index lookup + continuation: page(s) "
+                    f"{[p + 1 for p in expanded_sorted]} (0 API calls)[/green]"
+                )
+            else:
+                console.print(f"[green]  ✔ [Tier 1] Index lookup found page(s): {[p + 1 for p in expanded_sorted]} (0 API calls)[/green]")
+            return expanded_sorted
         console.print("[yellow]  ⚠ [Tier 1] Index lookup found nothing — falling back to Tier 2.[/yellow]")
 
     # ── Build candidate list from text pre-filter ─────────────────────────────
@@ -496,14 +536,16 @@ def find_fund_pages(
 
     system_prompt = (
         "You are a document navigation assistant for mutual fund fact sheets. "
-        "Identify which pages contain the DEDICATED FACT SHEET SECTION for the named fund. "
-        "The section typically shows that fund's NAV, portfolio details, returns table, AUM, holdings. "
+        "Identify ALL pages that belong to the DEDICATED FACT SHEET SECTION for the named fund. "
+        "A fund's fact sheet section often spans 2 or even 3 consecutive pages. "
+        "Include every page showing this fund's NAV, portfolio details, returns table, AUM, sector breakdown, or holdings. "
         "Return ONLY a JSON object with a single key 'data' containing an array of 1-based page numbers (integers)."
     )
     user_prefix = (
         f"Which of these pages contain the DEDICATED fact sheet section for: '{fund_name}'? "
-        "Look for the page(s) showing this fund's own NAV, AUM, returns, portfolio, and holdings. "
-        "Return ONLY a JSON object: {{\"data\": [22]}}. If none, return {{\"data\": []}}."
+        "IMPORTANT: A fund section can span MULTIPLE consecutive pages — return ALL of them. "
+        "Include every page that shows this fund's NAV, AUM, returns, portfolio, sector breakdown, or holdings. "
+        "Return ONLY a JSON object: {\"data\": [22, 23]}. If none, return {\"data\": []}."
     )
 
     relevant_pages: set[int] = set()
