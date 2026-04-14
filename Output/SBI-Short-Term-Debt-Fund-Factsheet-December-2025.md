@@ -1,48 +1,45 @@
 # SBI Short Term Debt Fund
 
 ## Benchmark Index
-Not available
+- CRISIL Short Duration Debt A-II Index
 
 ## Portfolio Details
-- **Fund Manager(s) and managing-since date**: Rajeev Radhakrishnan (Managing since Nov 2008)
-- **Fund category / type**: Debt - Short Duration Fund
-- **Investment objective**: To provide investors an opportunity to generate regular income with high degree of liquidity through investments in a portfolio comprising of money market instruments and short-term debt instruments.
-- **AUM (Assets Under Management)**: ₹ 20,635.85 Crores (as on Aug 31, 2023)
+- **Fund Manager(s) and managing-since date**: Ms. Mansi Sajeja, Managing Since Dec-2023
+- **Fund category / type**: An open ended short-term debt scheme
+- **Investment objective**: To provide investors an opportunity to generate regular income through investments in a portfolio comprising predominantly of debt instruments which are rated not below investment grade and money market instruments such that the Macaulay duration of the portfolio is between 1 year and 3 years.
+- **AUM (Assets Under Management)**: ₹17,504.63 Crores as on December 31, 2025
 - **NAV**: Not available
-- **Launch / Inception date**: July 25, 2007
+- **Launch / Inception date**: 27/7/2007
 - **Exit load**: Nil
-- **Expense ratio**: Regular Plan - 0.92%, Direct Plan - 0.32%
-- **Minimum investment / SIP amount**: Not available
+- **Expense ratio**: Not available
+- **Minimum investment / SIP amount**: Minimum Investment ₹5,000 & in multiples of ₹1; SIP: Daily - Minimum ₹500 & in multiples of ₹1 thereafter for a minimum of 12 instalments; Weekly - Minimum ₹1000 & in multiples of ₹1 thereafter for a minimum of 6 instalments or Minimum ₹500 & in multiples of ₹1 thereafter for a minimum of 12 instalments; Monthly - Minimum ₹1000 & in multiples of ₹1 thereafter for minimum six months or minimum ₹500 & in multiples of ₹1 thereafter for minimum one year; Quarterly - Minimum ₹1500 & in multiples of ₹1 thereafter for minimum one year; Semi Annual - Minimum ₹3000 & in multiples of ₹1 thereafter for a minimum of 4 installments; Annual - Minimum ₹5000 & in multiples of ₹1 thereafter for a minimum of 4 installments.
 - **Lock-in period**: Not available
-- **Any other portfolio metadata visible**: Not available
+- **Any other portfolio metadata visible**: Plans Available: Regular, Direct; Options: Growth, IDCW
 
 ## Quantitative Indicators
-- **Standard Deviation**: 1.92%
-- **Beta**: 0.12
-- **Sharpe Ratio**: 0.47
-- **Sortino Ratio**: Not available
-- **Alpha**: Not available
-- **Information Ratio**: Not available
-- **R-Squared**: Not available
-- **Treynor Ratio**: Not available
-- **Any other indicators present**: Not available
+- **Modified Duration**: 2.61
+- **Average Maturity**: 3.22 years
+- **Macaulay Duration**: 2.73 years
+- **Yield to Maturity**: 7.12%
 
 ## Returns
 Not available
 
 ## Top 5 Stock Holdings
-Not applicable – debt fund
+Not available
 
 ## Top 5 Sector Holdings
-Not applicable – debt fund
+Not available
 
 ## Group Exposure
 Not available
 
 ## Rating Profile
-| Rating       | % of Portfolio |
-|--------------|----------------|
-| AAA          | 47.92%         |
-| Sovereign    | 27.92%         |
-| AA+          | 11.92%         |
-| Cash & Others| 12.24%         |
+| Rating | % of Portfolio |
+|--------|----------------|
+| AAA and Equivalent | 55.76 |
+| AA+ | 7.62 |
+| Sovereign | 5.91 |
+| AA | 21.75 |
+| A1+ | 4.74 |
+| Cash, Cash Equivalents, And Others | 4.22 |

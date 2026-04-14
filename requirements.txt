@@ -1,4 +1,8 @@
+# OpenAI API client used for GPT-4o vision and text-only AI extraction
 openai>=1.3.0
+# Loads environment variables from a .env file
 python-dotenv>=1.0.0
+# Provides beautiful console output, progress bars, and interactive CLI tables
 rich>=13.0.0
+# Parses PDF files to extract the embedded text layer and convert pages to high-resolution images
 PyMuPDF>=1.23.0

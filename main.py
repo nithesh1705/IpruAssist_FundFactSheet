@@ -21,7 +21,7 @@ from rich.prompt import Prompt
 from rich.table import Table
 from rich import print as rprint
 
-from modules.pdf_reader import is_valid_pdf, get_pdf_page_images, get_pdf_filename_stem
+from modules.pdf_reader import is_valid_pdf, get_pdf_page_images, get_pdf_page_texts, get_pdf_filename_stem
 from modules.ai_extractor import extract_fund_names, extract_fund_details
 from modules.output_writer import save_markdown
 
@@ -86,10 +86,14 @@ def main():
     console.print(f"\n[green]✔ PDF validated:[/green] {file_path}")
     filename_stem = get_pdf_filename_stem(file_path)
 
-    # ── Step 3: Render PDF pages as images ───────────────────────────────────
-    console.print("\n[yellow]⟳ Rendering PDF pages...[/yellow]", end=" ")
-    page_images = get_pdf_page_images(file_path)
-    console.print(f"[green]{len(page_images)} page(s) rendered.[/green]")
+    # ── Step 3: Extract text layer ────────────────
+    console.print("\n[yellow]⟳ Extracting embedded text layer...[/yellow]", end=" ")
+    page_texts = get_pdf_page_texts(file_path)
+    text_pages_count = sum(1 for t in page_texts if t.strip())
+    console.print(
+        f"[green]{text_pages_count}/{len(page_texts)} page(s) have embedded text "
+        f"(used as primary accuracy source).[/green]"
+    )
 
     # ── Initialise OpenAI client ──────────────────────────────────────────────
     client = get_openai_client()
@@ -97,7 +101,7 @@ def main():
     # ── Step 4: Extract fund names via GPT-4o ─────────────────────────────────
     console.print("\n[yellow]⟳ Asking GPT-4o to identify all funds in the document...[/yellow]")
     try:
-        fund_names = extract_fund_names(client, page_images)
+        fund_names = extract_fund_names(client, file_path, page_texts)
     except Exception as e:
         console.print(f"[bold red]✗ Failed to extract fund names:[/bold red] {e}")
         sys.exit(1)
@@ -115,7 +119,7 @@ def main():
     # ── Step 6: Extract detailed data and save Markdown ───────────────────────
     console.print(f"\n[yellow]⟳ Extracting detailed data for '{selected_fund}'...[/yellow]")
     try:
-        markdown_content = extract_fund_details(client, page_images, selected_fund)
+        markdown_content = extract_fund_details(client, file_path, selected_fund, page_texts)
     except Exception as e:
         console.print(f"[bold red]✗ Failed to extract fund details:[/bold red] {e}")
         sys.exit(1)

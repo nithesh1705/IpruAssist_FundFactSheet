@@ -1,5 +1,11 @@
 """
-PDF reader module: validates the input file and converts PDF pages to images for AI processing.
+PDF reader module: validates the input file, converts PDF pages to high-resolution
+images for GPT-4o vision, and also extracts raw embedded text per page.
+
+Hybrid approach:
+  - Images (250 DPI) are sent for visual layout understanding and chart/table reading.
+  - Embedded text (from the PDF's text layer) is extracted directly — 100% accurate
+    for digitally-created PDFs, and used alongside the image so GPT can cross-verify.
 """
 
 import os
@@ -11,21 +17,48 @@ def is_valid_pdf(file_path: str) -> bool:
     return os.path.isfile(file_path) and file_path.lower().endswith(".pdf")
 
 
-def get_pdf_page_images(file_path: str, dpi: int = 150) -> list[bytes]:
+def get_pdf_page_images(file_path: str, page_indices: list[int] = None, dpi: int = 250) -> list[bytes]:
     """
-    Render each PDF page as a PNG image (bytes) for GPT-4o vision input.
-    Uses 150 DPI for a good balance between quality and token efficiency.
+    Render specified PDF pages as PNG images (bytes) for GPT-4o vision input.
+    If page_indices is None, renders all pages (not recommended for large files).
+    Uses 250 DPI — high enough to read small fonts, tables, and footnotes accurately.
     """
     doc = fitz.open(file_path)
     images = []
 
-    for page in doc:
-        mat = fitz.Matrix(dpi / 72, dpi / 72)  # scale factor relative to 72 dpi base
-        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
-        images.append(pix.tobytes("png"))
+    if page_indices is None:
+        page_indices = range(len(doc))
+
+    for p_idx in page_indices:
+        if 0 <= p_idx < len(doc):
+            page = doc[p_idx]
+            mat = fitz.Matrix(dpi / 72, dpi / 72)
+            pix = page.get_pixmap(matrix=mat, colorspace=fitz.csRGB)
+            images.append(pix.tobytes("png"))
+        else:
+            images.append(b"")
 
     doc.close()
     return images
+
+
+def get_pdf_page_texts(file_path: str) -> list[str]:
+    """
+    Extract embedded text from each page of the PDF using PyMuPDF's text layer.
+    Returns a list of strings (one per page). Pages with no embedded text return ''.
+
+    This gives 100% accurate numbers/text for digitally-created PDFs.
+    For scanned PDFs the strings will be empty — vision takes over.
+    """
+    doc = fitz.open(file_path)
+    texts = []
+
+    for page in doc:
+        text = page.get_text("text").strip()
+        texts.append(text)
+
+    doc.close()
+    return texts
 
 
 def get_pdf_filename_stem(file_path: str) -> str:

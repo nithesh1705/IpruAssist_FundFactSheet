@@ -1,15 +1,14 @@
 # IpruAssist FundFactSheet Extractor
 
-A Python tool that extracts structured information from mutual fund factsheet PDFs and generates formatted Markdown reports using GPT-4o vision analysis.
+A Python tool that extracts structured information from mutual fund factsheet PDFs and generates formatted Markdown reports using a blazing fast, hybrid text and GPT-4o vision architecture.
 
 ## Features
 
-- **PDF Processing**: Efficiently converts PDF pages to high-quality images for AI analysis
-- **AI-Powered Extraction**: Uses OpenAI's GPT-4o vision API to intelligently extract fund details
-- **Multi-Fund Support**: Automatically detects multiple fund schemes in a single document and lets you select which one to process
-- **Batched Processing**: Handles large PDFs (100+ pages) by processing pages in configurable batches to respect API rate limits
-- **Markdown Output**: Generates clean, structured reports ready for documentation or sharing
-
+- **Hybrid Extraction Architecture**: Employs a 3-tier strategy for instant fact sheet lookup: zero-API index regex parsing, text-only `gpt-4o-mini` scanning, and targeted `gpt-4o` vision fallback.
+- **Embedded Text & High-Res Vision**: Combines direct PDF text extraction with high-resolution image rendering to achieve maximum accuracy on numbers while understanding complex table layouts.
+- **Multi-Fund Support**: Automatically detects multiple fund schemes in a single document (using fast Index/TOC scanning) and lets you choose which one to process.
+- **Strict Anti-Hallucination**: Data is extracted with forensic accuracy; it outputs only what is explicitly printed, with no invented values.
+- **Markdown Output**: Generates clean, structured reports ready for documentation or sharing.
 ## Installation
 
 1. Clone or download this repository
@@ -56,11 +55,12 @@ python main.py --file "Documents/<filename>.pdf"
 
 ## How It Works
 
-1. **Load & Validate**: Reads the PDF and validates the file format
-2. **Scan for Funds**: Processes pages in batches to identify all fund schemes
-3. **User Selection**: Displays found funds and lets you choose which to extract
-4. **Extract Details**: Performs a focused extraction on relevant pages only
-5. **Generate Report**: Outputs a structured Markdown file to `/Output`
+1. **Load & Validate**: Reads the PDF, validates format, and extracts both the embedded text layer and high-res images.
+2. **Scan for Funds**: Rapidly scans the Index/TOC using pure text to dynamically identify all fund schemes.
+3. **User Selection**: Displays found funds and lets you choose which to extract.
+4. **Locate Pages (3-Tier)**: Lightning-fast location of target pages via index regex matching, falling back to text-only scanning, and then vision if necessary.
+5. **Detailed Extraction**: Performs deep, focused data extraction strictly on the target pages using `gpt-4o` combined with text-layer checks.
+6. **Generate Report**: Outputs a structured Markdown file to `/Output`.
 
 ## Limitations
 

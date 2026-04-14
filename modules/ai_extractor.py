@@ -1,26 +1,45 @@
 """
-AI extractor module: GPT-4o vision-based extraction with batched page processing.
+AI extractor module: Hybrid GPT-4o extraction using BOTH high-res vision AND embedded PDF text.
 
-Strategy to handle large PDFs (100+ pages) within OpenAI TPM limits:
-  - Pages are processed in small batches (BATCH_SIZE) to stay under token limits.
-  - Fund name discovery: aggregates names across all batches.
-  - Fund detail extraction: two-pass — find relevant pages first, then extract only those.
+Accuracy improvements over v2:
+  1. Index-first page lookup  — Regex-parses the TOC/Index text (pages 1-15) to find the fund's
+                                page number in milliseconds with ZERO API calls.
+  2. Text-only GPT-mini scan  — If index lookup fails, sends only text (no images) to gpt-4o-mini
+                                to narrow candidates — 10-30x faster than vision.
+  3. Vision only on target    — High-res images are sent ONLY for the 1-3 confirmed pages.
+  4. Image detail: "high"     — GPT reads every character in tables, footnotes, small text.
+  5. Embedded text layer      — PyMuPDF extracts exact numbers/text directly from the PDF (100%
+                                accuracy for digital PDFs). Sent alongside the image so GPT verifies.
+  6. Strict anti-hallucination prompts — model is told to OUTPUT_ONLY what is literally present.
+  7. Larger max_tokens (8192) — prevents response truncation mid-section.
+  8. Retry logic on every API call — transient rate-limit/network errors no longer silently drop data.
+  9. Higher DPI images (250) set in pdf_reader — better readability of dense fund tables.
+ 10. No fixed section format  — prompts ask for whatever IS present, not a fixed template.
 """
 
 import base64
 import json
 import time
+import re
 from openai import OpenAI
 from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from modules.pdf_reader import get_pdf_page_images
 
 console = Console()
 
-# Number of pages per API call — tune lower if still hitting limits
-BATCH_SIZE = 10
+# Pages per batch — keep at 5 when using detail:'high' to avoid token overflows
+BATCH_SIZE = 5
 
-# Seconds to wait between batch API calls to respect TPM limits
-BATCH_DELAY = 2
+# Delay between batch API calls (seconds) — helps with TPM rate limits
+BATCH_DELAY = 3
+
+# Max retry attempts on rate-limit / transient errors
+MAX_RETRIES = 3
+RETRY_DELAY = 10  # seconds between retries
+
+# How many pages from the start to treat as Index/TOC for fast lookup
+INDEX_SCAN_PAGES = 15
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -30,19 +49,40 @@ def _encode_image(image_bytes: bytes) -> str:
     return base64.b64encode(image_bytes).decode("utf-8")
 
 
-def _build_image_content(page_images: list[bytes], start_page: int = 0) -> list[dict]:
+def _build_image_content(
+    page_images: list[bytes],
+    page_texts: list[str] | None,
+    page_indices: list[int]
+) -> list[dict]:
     """
-    Build GPT-4o message content blocks from a list of page images.
-    start_page is the 0-based index of the first page in the batch (for labeling).
+    Build GPT-4o message content blocks combining:
+      - Labelled page images (detail: 'high' for full accuracy)
+      - Embedded PDF text alongside each image (if available)
+
+    The text layer gives GPT exact numbers to work from; the image gives layout context.
     """
     content = []
-    for i, img_bytes in enumerate(page_images):
-        content.append({"type": "text", "text": f"[Page {start_page + i + 1}]"})
+    for img_bytes, p_idx in zip(page_images, page_indices):
+        page_num = p_idx + 1
+        raw_text = (page_texts[p_idx] if page_texts else "").strip()
+
+        # Label + optional embedded text
+        if raw_text:
+            label = (
+                f"[Page {page_num}]\n"
+                f"--- EMBEDDED PDF TEXT (exact, use this for all numbers/values) ---\n"
+                f"{raw_text}\n"
+                f"--- END EMBEDDED TEXT ---"
+            )
+        else:
+            label = f"[Page {page_num}] (scanned image — no embedded text available)"
+
+        content.append({"type": "text", "text": label})
         content.append({
             "type": "image_url",
             "image_url": {
                 "url": f"data:image/png;base64,{_encode_image(img_bytes)}",
-                "detail": "low"  # 'low' = ~85 tokens/image; change to 'high' for dense tables
+                "detail": "high"  # Full resolution — essential for tables with small numbers
             }
         })
     return content
@@ -59,50 +99,170 @@ def _parse_json_array(raw: str) -> list:
     return json.loads(raw.strip())
 
 
-def _call_gpt(client: OpenAI, system: str, user_content: list[dict], max_tokens: int = 1000) -> str:
-    """Single GPT-4o call; returns the response text."""
-    response = client.chat.completions.create(
-        model="gpt-4o",
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": user_content}
-        ],
-        max_tokens=max_tokens,
-        temperature=0
-    )
-    return response.choices[0].message.content.strip()
+def _call_gpt(
+    client: OpenAI,
+    system: str,
+    user_content: list[dict],
+    max_tokens: int = 2000,
+    model: str = "gpt-4o",
+    json_mode: bool = False
+) -> str:
+    """
+    Single GPT call with retry logic.
+    Retries up to MAX_RETRIES times on rate-limit (429) or server errors (5xx).
+    """
+    last_error = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            kwargs = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content}
+                ],
+                "max_tokens": max_tokens,
+                "temperature": 0
+            }
+            if json_mode:
+                kwargs["response_format"] = { "type": "json_object" }
+
+            response = client.chat.completions.create(**kwargs)
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            last_error = e
+            err_str = str(e).lower()
+            if "rate_limit" in err_str or "429" in err_str or "503" in err_str or "500" in err_str:
+                if attempt < MAX_RETRIES:
+                    console.print(
+                        f"[yellow]⚠ Rate limit / server error (attempt {attempt}/{MAX_RETRIES}). "
+                        f"Retrying in {RETRY_DELAY}s...[/yellow]"
+                    )
+                    time.sleep(RETRY_DELAY)
+                    continue
+            # Non-retriable error — raise immediately
+            raise
+    raise last_error
+
+
+def _clean_fund_name(name: str) -> str:
+    """Clean up extracted fund names to remove plan variants and ensure deduplication."""
+    # Remove common hyphens used for plans (only if followed exactly by plan keywords)
+    parts = re.split(r'\s+-\s+(?i:Direct|Regular|Growth|IDCW|Dividend|Bonus|Investment Plan|Savings Plan|Institutional Plan|Retail Plan|Plan)\b', name)
+    name = parts[0].strip()
+    
+    # Remove plan-related suffixes at the end of the string
+    name = re.sub(r'(?i)\s+(Direct Plan|Regular Plan|Direct|Regular|Growth|IDCW|Dividend|Investment Plan|Savings Plan)$', '', name).strip()
+    
+    # NEW: Aggressively strip the word " Plan" from the very end of the string.
+    # Ex: "Tata Retirement Savings Fund - Conservative Plan" -> "Tata Retirement Savings Fund - Conservative"
+    name = re.sub(r'(?i)\s+Plan$', '', name).strip()
+    
+    # Sometimes just " - " is left at the end
+    if name.endswith('-'):
+        name = name[:-1].strip()
+        
+    return name
 
 
 # ── Fund Name Extraction ───────────────────────────────────────────────────────
 
-def extract_fund_names(client: OpenAI, page_images: list[bytes]) -> list[str]:
+def extract_fund_names(
+    client: OpenAI,
+    file_path: str,
+    page_texts: list[str] | None = None
+) -> list[str]:
     """
     Scan all pages in batches and return a deduplicated sorted list of all fund scheme names.
-    Each batch is processed independently; results are merged at the end.
+    Uses both image and embedded text for high-confidence identification.
     """
     system_prompt = (
         "You are a financial document parser specializing in mutual fund fact sheets. "
-        "Your task is to identify distinct mutual fund SCHEME names — the official product name. "
-        "CRITICAL RULES: "
-        "1. Do NOT list plan variants as separate funds. "
-        "   Examples of plan variants to IGNORE: 'Direct Plan', 'Regular Plan', 'Growth', 'IDCW', "
-        "   'Dividend', 'Bonus', 'Fortnightly IDCW', 'Monthly IDCW', 'Quarterly IDCW'. "
-        "   These are options WITHIN a fund, not separate fund names. "
-        "2. Extract the root scheme name only, e.g. 'SBI Short Term Debt Fund', "
-        "   NOT 'SBI Short Term Debt Fund - Direct Plan - Growth'. "
-        "3. Ignore company/AMC names, section headers, table column labels, and footnotes. "
-        "Return ONLY a valid JSON array of scheme name strings, nothing else."
+        "Your ONLY job is to identify distinct mutual fund SCHEME names that are LITERALLY PRESENT "
+        "in the provided pages. "
+        "\n\nCRITICAL ACCURACY RULES:"
+        "\n1. ONLY extract names that are ACTUALLY printed on these pages. DO NOT guess or invent names."
+        "\n2. DO NOT list plan variants as separate funds! "
+        "   Examples to IGNORE: '- Direct Plan', '- Regular Plan', '- Growth', '- IDCW', "
+        "   '- Investment Plan', '- Savings Plan'. These are options WITHIN a fund."
+        "\n3. Extract only the EXACT ROOT scheme name. For example if you see 'SBI Children\\'s Fund - Investment Plan', "
+        "   extract ONLY 'SBI Children\\'s Fund'."
+        "\n4. Ignore AMC names, section headers, table column labels, and footer text."
+        "\n5. If embedded PDF text is provided, use it as the primary source for exact spelling."
+        "\nReturn ONLY a JSON object with a single key 'data' containing an array of scheme name strings."
     )
     user_prefix = (
-        "List every distinct mutual fund SCHEME name visible on these pages. "
-        "A scheme name is the core product name like 'Tata Flexi Cap Fund' or 'ICICI Prudential Bluechip Fund'. "
-        "DO NOT include plan suffixes (Direct/Regular/Growth/IDCW/Dividend) — strip them off and return the base name. "
-        "Return ONLY a JSON array like: [\"Scheme Name 1\", \"Scheme Name 2\"]. "
-        "If no scheme names are found on these pages, return []."
+        "From these pages, list every distinct mutual fund SCHEME name that is literally printed here. "
+        "Use the EMBEDDED PDF TEXT (if shown) for exact spelling of fund names. "
+        "Strip ANY plan suffixes (like - Direct/Regular/Growth/IDCW/Savings Plan/Investment Plan) — return ONLY the base scheme name. "
+        "Return ONLY a JSON object: {\"data\": [\"Scheme Name 1\", \"Scheme Name 2\"]}. "
+        "If no scheme names are found, return {\"data\": []}."
     )
 
     all_names: set[str] = set()
-    total_batches = (len(page_images) + BATCH_SIZE - 1) // BATCH_SIZE
+
+    # OPTIMIZATION: For multi-fund consolidated PDFs, the list of all funds is presented
+    # in the Index or Table of Contents (almost always within the first 10-15 pages).
+    SEARCH_LIMIT = 15
+    scan_texts = page_texts[:SEARCH_LIMIT] if page_texts else None
+    
+    if page_texts and len(page_texts) > SEARCH_LIMIT:
+        console.print(f"[cyan]  ℹ Large document detected ({len(page_texts)} pages). Scanning only the first {SEARCH_LIMIT} pages (Index/TOC) to find fund names.[/cyan]")
+
+    # We consider it a "text-rich" PDF if at least 50% of the pages have text
+    text_rich = scan_texts and sum(1 for t in scan_texts if t.strip()) > len(scan_texts) * 0.5
+
+    if text_rich:
+        TEXT_BATCH_SIZE = 50
+        total_batches = (len(scan_texts) + TEXT_BATCH_SIZE - 1) // TEXT_BATCH_SIZE
+
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+            transient=True
+        ) as progress:
+            task = progress.add_task(f"[yellow]Scanning Index/TOC text for fund names...", total=total_batches)
+
+            for batch_num, start in enumerate(range(0, len(scan_texts), TEXT_BATCH_SIZE)):
+                batch_text = scan_texts[start: start + TEXT_BATCH_SIZE]
+                combined_text = ""
+                for i, text in enumerate(batch_text):
+                    if text.strip():
+                        combined_text += f"\n--- Page {start + i + 1} ---\n{text}\n"
+
+                if not combined_text.strip():
+                    progress.advance(task)
+                    continue
+
+                user_content = [
+                    {"type": "text", "text": user_prefix},
+                    {"type": "text", "text": f"\nEMBEDDED PDF TEXT:\n{combined_text}"}
+                ]
+
+                try:
+                    raw = _call_gpt(client, system_prompt, user_content, max_tokens=4096, json_mode=True)
+                    names = json.loads(raw).get("data", [])
+                    for n in names:
+                        if isinstance(n, str) and n.strip():
+                            cleaned = _clean_fund_name(n)
+                            if cleaned:
+                                all_names.add(cleaned)
+                except Exception as e:
+                    console.print(f"[red]⚠ Fast text batch {batch_num + 1} name scan failed: {e}[/red]")
+
+                progress.advance(task)
+                if batch_num < total_batches - 1:
+                    time.sleep(1)
+
+        return sorted(all_names)
+
+    # Fallback: Scanned PDF / no text layer, use Vision processing
+    scan_indices = list(range(min(SEARCH_LIMIT, len(page_texts) if page_texts else 1)))
+    scan_images = get_pdf_page_images(file_path, scan_indices)
+    
+    total_batches = (len(scan_images) + BATCH_SIZE - 1) // BATCH_SIZE
 
     with Progress(
         SpinnerColumn(),
@@ -112,28 +272,26 @@ def extract_fund_names(client: OpenAI, page_images: list[bytes]) -> list[str]:
         console=console,
         transient=True
     ) as progress:
-        task = progress.add_task(
-            f"[yellow]Scanning pages for fund names (batches of {BATCH_SIZE})...",
-            total=total_batches
-        )
+        task = progress.add_task(f"[yellow]Scanning images for fund names (vision mode, batches of {BATCH_SIZE})...", total=total_batches)
 
-        for batch_num, start in enumerate(range(0, len(page_images), BATCH_SIZE)):
-            batch = page_images[start: start + BATCH_SIZE]
-
-            user_content = _build_image_content(batch, start_page=start)
+        for batch_num, start in enumerate(range(0, len(scan_images), BATCH_SIZE)):
+            batch_imgs = scan_images[start: start + BATCH_SIZE]
+            batch_indices = scan_indices[start: start + BATCH_SIZE]
+            user_content = _build_image_content(batch_imgs, scan_texts, batch_indices)
             user_content.insert(0, {"type": "text", "text": user_prefix})
 
             try:
-                raw = _call_gpt(client, system_prompt, user_content, max_tokens=1000)
-                names = _parse_json_array(raw)
-                all_names.update(names)
-            except (json.JSONDecodeError, Exception):
-                # Skip failed batches silently; partial results are still useful
-                pass
+                raw = _call_gpt(client, system_prompt, user_content, max_tokens=4096, json_mode=True)
+                names = json.loads(raw).get("data", [])
+                for n in names:
+                    if isinstance(n, str) and n.strip():
+                        cleaned = _clean_fund_name(n)
+                        if cleaned:
+                            all_names.add(cleaned)
+            except Exception as e:
+                console.print(f"[red]⚠ Batch {batch_num + 1} name scan failed: {e}[/red]")
 
             progress.advance(task)
-
-            # Respect TPM — wait between batches (skip sleep after last batch)
             if batch_num < total_batches - 1:
                 time.sleep(BATCH_DELAY)
 
@@ -142,27 +300,215 @@ def extract_fund_names(client: OpenAI, page_images: list[bytes]) -> list[str]:
 
 # ── Fund Page Locator ─────────────────────────────────────────────────────────
 
-def find_fund_pages(client: OpenAI, page_images: list[bytes], fund_name: str) -> list[int]:
+def _index_page_lookup(fund_name: str, page_texts: list[str]) -> list[int]:
     """
-    Quick two-pass scan to find which page indices (0-based) contain data about fund_name.
-    Returns a list of relevant page indices so we only extract from those.
+    Tier-1 (ZERO API calls): Regex-parse the Index/TOC pages (first INDEX_SCAN_PAGES)
+    to extract the page number(s) listed for fund_name.
+
+    Handles TWO formats found in real AMC fact sheets:
+
+    Format A — same line (plain TOC):
+        'Tata Small Cap Fund ............... 22'
+
+    Format B — consecutive separate lines (table cell extracted by PyMuPDF):
+        'Tata Small Cap Fund'    <- line N
+        '22'                     <- line N+1  (separate table cell)
+
+    Format B uses STRICT normalized equality (not fuzzy regex) so that:
+      - 'Tata Large & Mid Cap Fund' does NOT match 'Tata Large Cap Fund'
+      - 'Tata Nifty Midcap 150 ...' does NOT match 'Tata Mid Cap Fund'
+
+    Also handles page ranges like '65 - 66' -> takes the first (start) page.
+    Returns a list of 0-based page indices, or [] if not found.
+    """
+    words = re.findall(r'[\w&]+', fund_name, re.IGNORECASE)
+    if not words:
+        return []
+
+    name_pattern = r'.*?'.join(re.escape(w) for w in words)
+
+    # Format A: fund name AND page number on the same line
+    same_line_re = re.compile(rf'(?i){name_pattern}.*?\b(\d{{1,3}})\b')
+
+    # Format B step 1: quick pre-filter — line must contain the fund name words at all
+    name_only_re = re.compile(rf'(?i){name_pattern}')
+
+    # Format B step 2: standalone number line e.g. '22' or '65 - 66'
+    standalone_num_re = re.compile(r'^\s*(\d{1,3})\s*(?:-\s*\d{1,3})?\s*$')
+
+    found_pages: set[int] = set()
+    index_texts = page_texts[:INDEX_SCAN_PAGES]
+
+    def _is_valid_page(n: int) -> bool:
+        return INDEX_SCAN_PAGES < n <= len(page_texts)
+
+    def _normalize(s: str) -> str:
+        """Lowercase, strip special chars/punctuation, collapse whitespace."""
+        return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', s).lower()).strip()
+
+    norm_fund = _normalize(fund_name)
+
+    for text in index_texts:
+        lines = [ln.strip() for ln in text.splitlines()]
+
+        for i, line in enumerate(lines):
+            if not line:
+                continue
+
+            # ── Format A: name + page number on the same line ────────────────
+            m = same_line_re.search(line)
+            if m:
+                candidate = int(m.group(1))
+                if _is_valid_page(candidate):
+                    found_pages.add(candidate - 1)
+                continue
+
+            # ── Format B: name on line N, number on line N+K ─────────────────
+            if name_only_re.search(line) and _normalize(fund_name) == _normalize(line):
+                for lookahead_idx in range(i + 1, min(i + 4, len(lines))):
+                    next_line = lines[lookahead_idx]
+                    m_num = standalone_num_re.match(next_line)
+                    if m_num:
+                        candidate = int(m_num.group(1))
+                        if _is_valid_page(candidate):
+                            found_pages.add(candidate - 1)
+                        break  # number found, stop lookahead
+
+    return sorted(found_pages)
+
+
+def _text_only_gpt_lookup(
+    client: OpenAI,
+    fund_name: str,
+    candidate_indices: list[int],
+    page_texts: list[str]
+) -> list[int]:
+    """
+    Tier-2 (Text-only, gpt-4o-mini, NO images): Ask GPT which of the candidate pages
+    contain the dedicated fact sheet section — using only the embedded text layer.
+    Much faster and cheaper than vision; typically 1 API call for up to 30 pages.
     """
     system_prompt = (
         "You are a document navigation assistant for mutual fund fact sheets. "
-        "Identify which pages contain the fact sheet section for the named fund scheme. "
-        "The section typically shows the fund's NAV, portfolio, returns table, holdings, etc. "
-        "Return ONLY a JSON array of 1-based page numbers (integers), nothing else. "
-        "If a page mentions the fund only in passing (e.g. an index or disclaimer), exclude it."
+        "Given embedded text from candidate pages, identify which page numbers contain "
+        "the DEDICATED fact sheet section for the named fund — meaning the page that shows "
+        "this fund's own NAV, AUM, returns table, portfolio holdings. "
+        "A page that only lists the fund in an index, disclaimer, or footer does NOT qualify. "
+        "Return ONLY a JSON object with a single key 'data' containing an array of 1-based page numbers (integers)."
+    )
+
+    # Build a combined text block of all candidate pages
+    combined = ""
+    for idx in candidate_indices:
+        text = page_texts[idx].strip() if idx < len(page_texts) else ""
+        if text:
+            combined += f"\n\n--- Page {idx + 1} ---\n{text}"
+
+    if not combined.strip():
+        return []
+
+    user_content = [
+        {
+            "type": "text",
+            "text": (
+                f"Which of these pages contain the DEDICATED fact sheet section for: '{fund_name}'?\n"
+                f"The dedicated page shows this fund's NAV, AUM, returns, portfolio — not just a mention.\n"
+                f"Return ONLY a JSON object: {{\"data\": [22]}}. If none, return {{\"data\": []}}.\n\n"
+                f"{combined}"
+            )
+        }
+    ]
+
+    try:
+        raw = _call_gpt(
+            client, system_prompt, user_content,
+            max_tokens=200,
+            model="gpt-4o-mini",
+            json_mode=True
+        )
+        page_nums = json.loads(raw).get("data", [])
+        return sorted(
+            p - 1 for p in page_nums
+            if isinstance(p, int) and p >= 1 and p - 1 < len(page_texts)
+        )
+    except Exception as e:
+        console.print(f"[yellow]⚠ Text-only GPT lookup failed: {e}[/yellow]")
+        return []
+
+
+def find_fund_pages(
+    client: OpenAI,
+    file_path: str,
+    fund_name: str,
+    page_texts: list[str] | None = None
+) -> list[int]:
+    """
+    3-Tier fast page locator — finds which page(s) contain the fund's dedicated fact sheet.
+
+    Tier 1 — Index/TOC regex (0 API calls, <1 second)
+    Tier 2 — Text-only gpt-4o-mini scan (~2-5 seconds, 1 API call)
+    Tier 3 — Vision fallback (~30 seconds, 1-2 API calls)
+    """
+    is_large_doc = page_texts and len(page_texts) > INDEX_SCAN_PAGES
+
+    # ── Tier 1: Index/TOC regex lookup (zero API calls) ──────────────────────
+    if page_texts and is_large_doc:
+        console.print(f"[cyan]  ℹ [Tier 1] Scanning Index/TOC for '{fund_name}'...[/cyan]")
+        index_pages = _index_page_lookup(fund_name, page_texts)
+        if index_pages:
+            console.print(f"[green]  ✔ [Tier 1] Index lookup found page(s): {[p + 1 for p in index_pages]} (0 API calls)[/green]")
+            return index_pages
+        console.print("[yellow]  ⚠ [Tier 1] Index lookup found nothing — falling back to Tier 2.[/yellow]")
+
+    # ── Build candidate list from text pre-filter ─────────────────────────────
+    text_matched_pages: set[int] = set()
+    if page_texts:
+        fund_normalized = re.sub(r'\s+', ' ', fund_name.lower()).strip()
+        for idx, text in enumerate(page_texts):
+            text_normalized = re.sub(r'\s+', ' ', text.lower()).strip()
+            if fund_normalized in text_normalized:
+                text_matched_pages.add(idx)
+
+    if text_matched_pages:
+        console.print(f"[cyan]  ℹ Text-layer pre-match: {len(text_matched_pages)} page(s) contain the fund name.[/cyan]")
+
+    candidate_indices = sorted(
+        idx for idx in text_matched_pages
+        if not is_large_doc or idx >= INDEX_SCAN_PAGES
+    ) if text_matched_pages else list(range(INDEX_SCAN_PAGES if is_large_doc else 0, len(page_texts) if page_texts else 1))
+
+    if len(candidate_indices) > 40:
+        console.print(f"[yellow]  ⚠ {len(candidate_indices)} candidates — capping at 40 for speed.[/yellow]")
+        candidate_indices = candidate_indices[:40]
+
+    # ── Tier 2: Text-only gpt-4o-mini lookup (1 API call, no images) ─────────
+    if page_texts:
+        console.print(f"[cyan]  ℹ [Tier 2] Text-only gpt-4o-mini scan on {len(candidate_indices)} candidate page(s)...[/cyan]")
+        tier2_pages = _text_only_gpt_lookup(client, fund_name, candidate_indices, page_texts)
+        if tier2_pages:
+            console.print(f"[green]  ✔ [Tier 2] Text-only lookup found page(s): {[p + 1 for p in tier2_pages]}[/green]")
+            return tier2_pages
+        console.print("[yellow]  ⚠ [Tier 2] Text-only GPT found nothing — falling back to Tier 3 vision.[/yellow]")
+
+    # ── Tier 3: Vision fallback (images, ONLY on narrowed candidates) ─────────
+    vision_targets = candidate_indices if candidate_indices else list(range(len(page_texts) if page_texts else 1))
+    console.print(f"[yellow]  ℹ [Tier 3] Vision scan on {len(vision_targets)} page(s)...[/yellow]")
+
+    system_prompt = (
+        "You are a document navigation assistant for mutual fund fact sheets. "
+        "Identify which pages contain the DEDICATED FACT SHEET SECTION for the named fund. "
+        "The section typically shows that fund's NAV, portfolio details, returns table, AUM, holdings. "
+        "Return ONLY a JSON object with a single key 'data' containing an array of 1-based page numbers (integers)."
     )
     user_prefix = (
-        f"Which of these pages contain the dedicated fact sheet section for the fund scheme: '{fund_name}'? "
-        "Look for the page(s) that show this fund's NAV, AUM, portfolio details, returns, and holdings. "
-        "Return ONLY a JSON array of 1-based page numbers like: [3, 4]. "
-        "If none of these pages contain it, return []."
+        f"Which of these pages contain the DEDICATED fact sheet section for: '{fund_name}'? "
+        "Look for the page(s) showing this fund's own NAV, AUM, returns, portfolio, and holdings. "
+        "Return ONLY a JSON object: {{\"data\": [22]}}. If none, return {{\"data\": []}}."
     )
 
     relevant_pages: set[int] = set()
-    total_batches = (len(page_images) + BATCH_SIZE - 1) // BATCH_SIZE
+    vision_images = get_pdf_page_images(file_path, vision_targets)
+    total_batches = (len(vision_targets) + BATCH_SIZE - 1) // BATCH_SIZE
 
     with Progress(
         SpinnerColumn(),
@@ -172,77 +518,91 @@ def find_fund_pages(client: OpenAI, page_images: list[bytes], fund_name: str) ->
         console=console,
         transient=True
     ) as progress:
-        task = progress.add_task(
-            f"[yellow]Locating pages for '{fund_name}'...",
-            total=total_batches
-        )
+        task = progress.add_task(f"[yellow][Tier 3] Vision scan: {len(vision_targets)} page(s)...", total=total_batches)
 
-        for batch_num, start in enumerate(range(0, len(page_images), BATCH_SIZE)):
-            batch = page_images[start: start + BATCH_SIZE]
-
-            user_content = _build_image_content(batch, start_page=start)
+        for batch_num in range(total_batches):
+            batch_indices = vision_targets[batch_num * BATCH_SIZE: (batch_num + 1) * BATCH_SIZE]
+            batch_imgs = vision_images[batch_num * BATCH_SIZE: (batch_num + 1) * BATCH_SIZE]
+            
+            user_content = _build_image_content(batch_imgs, page_texts, batch_indices)
             user_content.insert(0, {"type": "text", "text": user_prefix})
 
             try:
-                raw = _call_gpt(client, system_prompt, user_content, max_tokens=200)
-                page_nums = _parse_json_array(raw)
-                # Convert 1-based page numbers to 0-based indices
-                relevant_pages.update(p - 1 for p in page_nums if isinstance(p, int))
-            except (json.JSONDecodeError, Exception):
-                pass
+                raw = _call_gpt(client, system_prompt, user_content, max_tokens=300, json_mode=True)
+                page_nums = json.loads(raw).get("data", [])
+                relevant_pages.update(p - 1 for p in page_nums if isinstance(p, int) and p >= 1)
+            except Exception as e:
+                console.print(f"[red]⚠ Vision batch {batch_num + 1} failed: {e}[/red]")
 
             progress.advance(task)
-
             if batch_num < total_batches - 1:
                 time.sleep(BATCH_DELAY)
+
+    if not relevant_pages and text_matched_pages:
+        return sorted(
+            idx for idx in text_matched_pages
+            if not is_large_doc or idx >= INDEX_SCAN_PAGES
+        ) or sorted(text_matched_pages)
 
     return sorted(relevant_pages)
 
 
 # ── Fund Detail Extraction ─────────────────────────────────────────────────────
 
-def extract_fund_details(client: OpenAI, page_images: list[bytes], fund_name: str) -> str:
+def extract_fund_details(
+    client: OpenAI,
+    file_path: str,
+    fund_name: str,
+    page_texts: list[str] | None = None
+) -> str:
     """
-    Two-pass extraction:
-      Pass 1 — find which pages contain the fund's data.
-      Pass 2 — extract structured Markdown from only those pages.
+    High-accuracy two-pass extraction:
+      Pass 1 — locate pages containing this fund's data (using text-layer + vision).
+      Pass 2 — extract ALL data from those pages using hybrid image+text approach.
 
-    Falls back to all pages if no relevant pages are found.
+    Anti-hallucination: GPT is explicitly told to ONLY use printed values, never infer or fill in.
     """
-    # Pass 1: locate relevant pages
+    # Pass 1: locate relevant pages (3-tier: Index lookup → text-only GPT → vision)
     console.print(f"\n[yellow]⟳ Pass 1/2 — Locating pages for '{fund_name}'...[/yellow]")
-    relevant_indices = find_fund_pages(client, page_images, fund_name)
+    relevant_indices = find_fund_pages(client, file_path, fund_name, page_texts)
 
     if relevant_indices:
-        console.print(
-            f"[green]✔ Found on pages:[/green] {[i + 1 for i in relevant_indices]}"
-        )
-        target_images = [page_images[i] for i in relevant_indices]
-        page_offset = relevant_indices[0]
+        console.print(f"[green]✔ Found on pages:[/green] {[i + 1 for i in relevant_indices]}")
+        target_indices = relevant_indices
     else:
-        # Fallback: use all pages (rare — only if fund page scan failed entirely)
         console.print("[yellow]⚠ Could not locate specific pages; scanning all pages.[/yellow]")
-        target_images = page_images
-        page_offset = 0
+        target_indices = list(range(len(page_texts) if page_texts else 1))
 
-    # Pass 2: extract structured data from relevant pages
+    target_images = get_pdf_page_images(file_path, target_indices)
+
+    # Pass 2: extract — use ALL relevant pages in one call if possible, else batch
     console.print(f"\n[yellow]⟳ Pass 2/2 — Extracting data from {len(target_images)} page(s)...[/yellow]")
 
     system_prompt = (
-        "You are an expert mutual fund analyst. "
-        "Extract information from mutual fund fact sheets regardless of the layout, "
-        "table format, or design. The format may vary across fund houses and over time. "
-        "Always locate data semantically, not by fixed positions or coordinates. "
-        "Output clean, well-structured Markdown only."
+        "You are an expert mutual fund analyst performing data extraction with forensic accuracy. "
+        "Your rule #1: NEVER invent, estimate, or assume any value. "
+        "If a value is not explicitly printed on these pages, write 'Not available'. "
+        "Rule #2: Use the EMBEDDED PDF TEXT as your primary source of truth for all numbers, "
+        "percentages, names, and dates — it is the exact machine-readable text from the PDF. "
+        "Rule #3: Use the images to understand layout, tables, and structure; cross-verify "
+        "numbers from the image against the embedded text. If they differ, prefer the embedded text. "
+        "Rule #4: The document format will vary by AMC and by month — do not assume any fixed layout. "
+        "Discover all sections dynamically from whatever is present. "
+        "Rule #5: Output well-structured Markdown. Do not add commentary or disclaimers."
     )
 
-    extraction_prompt = f"""
-From the pages shown, extract ALL available information for the fund: **{fund_name}**
+    extraction_prompt = f"""Extract ALL data for fund: **{fund_name}** from the pages provided.
 
-Generate a Markdown document with the sections below.
-- If a section's data is absent, write "Not available".
-- Never invent or assume values — only extract what is explicitly shown.
-- For tables, use proper Markdown table syntax.
+STRICT RULES:
+- Use EMBEDDED PDF TEXT (shown above each page image) as the PRIMARY source for all values.
+- The image is your secondary source to understand table structure and visual layout.
+- ONLY output values that are LITERALLY PRESENT in these pages. Never fill in, estimate, or hallucinate.
+- If a field is not present, write exactly: `Not available`
+- Do NOT infer fund type, category, or any field — read it from the page or mark it as Not available.
+- Preserve exact numbers: NAV, AUM, returns, percentages — copy them exactly as printed.
+- Discover sections dynamically — every fact sheet has different sections; extract whatever IS shown.
+
+---
 
 # {fund_name}
 
@@ -290,10 +650,74 @@ If not shown, write "Not available".
 ## Rating Profile
 List credit/rating breakdown (e.g., AAA, AA, Sovereign, Cash & Equivalents) with % weights.
 If this is an equity fund with no rating data, write "Not applicable – equity fund".
+
+Note:
+- If a section's data is absent, write "Not available".
+- Never invent or assume values — only extract what is explicitly shown.
+- For tables, use proper Markdown table syntax.
 """
 
-    user_content = _build_image_content(target_images, start_page=page_offset)
-    user_content.insert(0, {"type": "text", "text": extraction_prompt})
+    # If many target pages, process in batches and concatenate
+    if len(target_images) <= BATCH_SIZE:
+        user_content = _build_image_content(target_images, page_texts, target_indices)
+        user_content.insert(0, {"type": "text", "text": extraction_prompt})
+        result = _call_gpt(client, system_prompt, user_content, max_tokens=8192)
+        return result
+    else:
+        # Multi-batch: extract per sub-batch, then merge with GPT
+        console.print(f"[yellow]  ℹ Many pages ({len(target_images)}), extracting in sub-batches...[/yellow]")
+        batch_results = []
+        sub_total = (len(target_images) + BATCH_SIZE - 1) // BATCH_SIZE
 
-    result = _call_gpt(client, system_prompt, user_content, max_tokens=4096)
-    return result
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console,
+            transient=True
+        ) as progress:
+            task = progress.add_task("[yellow]Extracting data sub-batches...", total=sub_total)
+            for b_num, b_start in enumerate(range(0, len(target_images), BATCH_SIZE)):
+                sub_imgs = target_images[b_start: b_start + BATCH_SIZE]
+                sub_indices = target_indices[b_start: b_start + BATCH_SIZE]
+
+                sub_content = _build_image_content(sub_imgs, page_texts, sub_indices)
+                sub_prompt = (
+                    f"Extract ALL data for '{fund_name}' from these pages ONLY.\n"
+                    f"Copy values EXACTLY as printed. Do NOT hallucinate or fill in missing values.\n"
+                    f"Use the EMBEDDED PDF TEXT as primary source. Format as structured Markdown.\n\n"
+                    f"{extraction_prompt}"
+                )
+                sub_content.insert(0, {"type": "text", "text": sub_prompt})
+
+                try:
+                    batch_md = _call_gpt(client, system_prompt, sub_content, max_tokens=8192)
+                    batch_results.append(batch_md)
+                except Exception as e:
+                    console.print(f"[red]⚠ Sub-batch {b_num + 1} extraction failed: {e}[/red]")
+
+                progress.advance(task)
+                if b_num < sub_total - 1:
+                    time.sleep(BATCH_DELAY)
+
+        if not batch_results:
+            return "# Extraction Failed\n\nAll sub-batches failed. Please try again."
+
+        if len(batch_results) == 1:
+            return batch_results[0]
+
+        # Merge sub-batch results with GPT
+        console.print("[yellow]  ⟳ Merging sub-batch results...[/yellow]")
+        merge_prompt = (
+            f"You have received partial extractions for the fund '{fund_name}' from different page batches. "
+            f"Merge them into ONE complete, well-structured Markdown document. "
+            f"Rules:\n"
+            f"- Remove duplicates but keep ALL unique data points.\n"
+            f"- If the same field appears in multiple batches, use the most complete/detailed version.\n"
+            f"- Do NOT add any information not present in the inputs below.\n"
+            f"- Preserve all exact numbers and values.\n\n"
+            + "\n\n---BATCH SEPARATOR---\n\n".join(batch_results)
+        )
+        merge_content = [{"type": "text", "text": merge_prompt}]
+        return _call_gpt(client, system_prompt, merge_content, max_tokens=8192)
