@@ -12,6 +12,7 @@ lets the user pick one, and generates a structured Markdown report in /Output.
 import os
 import sys
 import argparse
+from datetime import datetime
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -73,7 +74,7 @@ def main():
     console.print(Panel.fit(
         "[bold green]FundFactSheet Extractor[/bold green]\n"
         "[dim]Powered by GPT-4o · Supports any AMC format[/dim]",
-        border_style="green"
+        border_style="blue"
     ))
 
     # ── Step 1-2: Get and validate PDF path ───────────────────────────────────
@@ -124,7 +125,11 @@ def main():
         console.print(f"[bold red]✗ Failed to extract fund details:[/bold red] {e}")
         sys.exit(1)
 
-    output_path = save_markdown(filename_stem, markdown_content)
+    safe_fund_name = selected_fund.replace(" ", "_")
+    current_time_str = datetime.now().strftime("%d%m%Y_%H%M%S")
+    output_filename = f"{safe_fund_name}_{current_time_str}"
+
+    output_path = save_markdown(output_filename, markdown_content)
     console.print(f"\n[bold green]✔ Report saved:[/bold green] {output_path}")
     console.print(Panel.fit(
         f"[bold white]Output:[/bold white] {output_path}",

@@ -174,8 +174,56 @@ def extract_fund_names(
     """
     Scan all pages in batches and return a deduplicated sorted list of all fund scheme names.
     Uses both image and embedded text for high-confidence identification.
+
+    Two scanning modes:
+      Large doc (>SEARCH_LIMIT pages): scans the Index/TOC (first SEARCH_LIMIT pages) using a
+        PERMISSIVE prompt — funds are listed there without dedicated sections, so we extract every
+        fund name that appears in the index listing.
+      Small doc (<=SEARCH_LIMIT pages): uses a STRICT prompt — only funds whose dedicated fact
+        sheet section (NAV, AUM, returns, portfolio) is present on these pages are included, so
+        we don't accidentally pick up funds merely mentioned in disclaimers or footnotes.
     """
-    system_prompt = (
+    all_names: set[str] = set()
+
+    SEARCH_LIMIT = 15
+    scan_texts = page_texts[:SEARCH_LIMIT] if page_texts else None
+    is_large_doc = bool(page_texts and len(page_texts) > SEARCH_LIMIT)
+
+    if is_large_doc:
+        console.print(f"[cyan]  ℹ Large document detected ({len(page_texts)} pages). Scanning only the first {SEARCH_LIMIT} pages (Index/TOC) to find fund names.[/cyan]")
+
+    # ── Prompts ───────────────────────────────────────────────────────────────
+    # TOC/Index prompt — used for large docs scanning the index pages.
+    # The index lists fund names WITHOUT their dedicated fact sheet sections being present,
+    # so we must be permissive and extract everything listed there.
+    toc_system_prompt = (
+        "You are a financial document parser specializing in mutual fund fact sheets. "
+        "You are looking at INDEX or TABLE OF CONTENTS pages of a consolidated fact sheet booklet. "
+        "Your job is to extract every distinct mutual fund SCHEME name listed in this index. "
+        "\n\nCRITICAL ACCURACY RULES:"
+        "\n1. Extract EVERY scheme name listed in the index/TOC — these pages are the master list of all funds in this document."
+        "\n2. DO NOT list plan variants as separate funds! "
+        "   Examples to IGNORE: '- Direct Plan', '- Regular Plan', '- Growth', '- IDCW', "
+        "   '- Investment Plan', '- Savings Plan'. These are options WITHIN a fund, not separate schemes."
+        "\n3. Extract only the EXACT ROOT scheme name. For example if you see 'ICICI Pru Children\\'s Fund - Investment Plan', "
+        "   extract ONLY 'ICICI Pru Children\\'s Fund'."
+        "\n4. Ignore AMC names, column headers like 'Fund Name', 'Page No.', and any non-fund text."
+        "\n5. If embedded PDF text is provided, use it as the primary source for exact spelling."
+        "\nReturn ONLY a JSON object with a single key 'data' containing an array of scheme name strings."
+    )
+    toc_user_prefix = (
+        "These are INDEX or TABLE OF CONTENTS pages of a consolidated mutual fund fact sheet booklet. "
+        "Extract EVERY mutual fund SCHEME name listed in this index — it is the complete list of all funds in this document. "
+        "Use the EMBEDDED PDF TEXT (if shown) for exact spelling. "
+        "Strip ANY plan suffixes (like - Direct/Regular/Growth/IDCW/Savings Plan/Investment Plan) — return ONLY the base scheme name. "
+        "Return ONLY a JSON object: {\"data\": [\"Scheme Name 1\", \"Scheme Name 2\"]}. "
+        "If no scheme names are found, return {\"data\": []}."
+    )
+
+    # Content prompt — used for small/single-fund PDFs scanning actual content pages.
+    # Here we must be strict: only include a fund if it actually has a dedicated section
+    # on these pages, not just a passing mention in a disclaimer or footnote.
+    content_system_prompt = (
         "You are a financial document parser specializing in mutual fund fact sheets. "
         "Your ONLY job is to identify distinct mutual fund SCHEME names that have a DEDICATED FACT SHEET SECTION "
         "in the provided pages — meaning a section that shows that fund's own NAV, AUM, returns table, "
@@ -194,7 +242,7 @@ def extract_fund_names(
         "\n5. If embedded PDF text is provided, use it as the primary source for exact spelling."
         "\nReturn ONLY a JSON object with a single key 'data' containing an array of scheme name strings."
     )
-    user_prefix = (
+    content_user_prefix = (
         "From these pages, identify every mutual fund SCHEME that has a DEDICATED FACT SHEET SECTION here. "
         "A dedicated section means the page actually displays that fund's own NAV, AUM, returns, or portfolio data. "
         "Do NOT include funds that only appear in disclaimers, footnotes, SID references, benchmark names, "
@@ -205,15 +253,9 @@ def extract_fund_names(
         "If no scheme names are found, return {\"data\": []}."
     )
 
-    all_names: set[str] = set()
-
-    # OPTIMIZATION: For multi-fund consolidated PDFs, the list of all funds is presented
-    # in the Index or Table of Contents (almost always within the first 10-15 pages).
-    SEARCH_LIMIT = 15
-    scan_texts = page_texts[:SEARCH_LIMIT] if page_texts else None
-    
-    if page_texts and len(page_texts) > SEARCH_LIMIT:
-        console.print(f"[cyan]  ℹ Large document detected ({len(page_texts)} pages). Scanning only the first {SEARCH_LIMIT} pages (Index/TOC) to find fund names.[/cyan]")
+    # Pick the right prompt pair based on document size
+    system_prompt = toc_system_prompt if is_large_doc else content_system_prompt
+    user_prefix   = toc_user_prefix   if is_large_doc else content_user_prefix
 
     # We consider it a "text-rich" PDF if at least 50% of the pages have text
     text_rich = scan_texts and sum(1 for t in scan_texts if t.strip()) > len(scan_texts) * 0.5
@@ -230,7 +272,8 @@ def extract_fund_names(
             console=console,
             transient=True
         ) as progress:
-            task = progress.add_task(f"[yellow]Scanning Index/TOC text for fund names...", total=total_batches)
+            label = "Scanning Index/TOC text for fund names..." if is_large_doc else "Scanning document text for fund names..."
+            task = progress.add_task(f"[yellow]{label}", total=total_batches)
 
             for batch_num, start in enumerate(range(0, len(scan_texts), TEXT_BATCH_SIZE)):
                 batch_text = scan_texts[start: start + TEXT_BATCH_SIZE]
@@ -279,7 +322,8 @@ def extract_fund_names(
         console=console,
         transient=True
     ) as progress:
-        task = progress.add_task(f"[yellow]Scanning images for fund names (vision mode, batches of {BATCH_SIZE})...", total=total_batches)
+        label = "Scanning images for fund names (vision mode)..."
+        task = progress.add_task(f"[yellow]{label}", total=total_batches)
 
         for batch_num, start in enumerate(range(0, len(scan_images), BATCH_SIZE)):
             batch_imgs = scan_images[start: start + BATCH_SIZE]
@@ -361,7 +405,14 @@ def _index_page_lookup(fund_name: str, page_texts: list[str]) -> list[int]:
         """Lowercase, strip special chars/punctuation, collapse whitespace."""
         return re.sub(r'\s+', ' ', re.sub(r'[^\w\s]', '', s).lower()).strip()
 
+    def _strip_serial(s: str) -> str:
+        """Remove leading serial numbers like '36. ', '36) ', '36 ' from a TOC line."""
+        return re.sub(r'^\d+[\.\)]\s*', '', s).strip()
+
     norm_fund = _normalize(fund_name)
+
+    # Collect near-miss lines for debug when lookup fails
+    near_misses: list[str] = []
 
     for text in index_texts:
         lines = [ln.strip() for ln in text.splitlines()]
@@ -370,24 +421,44 @@ def _index_page_lookup(fund_name: str, page_texts: list[str]) -> list[int]:
             if not line:
                 continue
 
-            # ── Format A: name + page number (+ optional range end) on same line ──
+            # ── Format A: name + separator + page number on same line ──────────
+            # Guard: the character immediately before the captured page number
+            # must NOT be alphanumeric — prevents matching "150" in fund names.
             m = same_line_re.search(line)
             if m:
-                start_pg = int(m.group(1))
-                end_pg = int(m.group(2)) if m.group(2) else None
-                _add_range(start_pg, end_pg)
-                continue
+                num_start = m.start(1)
+                preceding = line[num_start - 1] if num_start > 0 else ' '
+                if not preceding.isalnum():
+                    start_pg = int(m.group(1))
+                    end_pg = int(m.group(2)) if m.group(2) else None
+                    _add_range(start_pg, end_pg)
+                    continue
 
             # ── Format B: name on line N, number/range on line N+K ────────────
-            if name_only_re.search(line) and _normalize(fund_name) == _normalize(line):
-                for lookahead_idx in range(i + 1, min(i + 4, len(lines))):
-                    next_line = lines[lookahead_idx]
-                    m_num = standalone_num_re.match(next_line)
-                    if m_num:
-                        start_pg = int(m_num.group(1))
-                        end_pg = int(m_num.group(2)) if m_num.group(2) else None
-                        _add_range(start_pg, end_pg)
-                        break  # number found, stop lookahead
+            if name_only_re.search(line):
+                # Accept exact match OR match after stripping a leading serial number
+                # (e.g. "36. SBI MNC Fund" → "SBI MNC Fund")
+                norm_line         = _normalize(line)
+                norm_line_stripped = _normalize(_strip_serial(line))
+                is_name_match = (norm_fund == norm_line) or (norm_fund == norm_line_stripped)
+
+                if is_name_match:
+                    for lookahead_idx in range(i + 1, min(i + 4, len(lines))):
+                        next_line = lines[lookahead_idx]
+                        m_num = standalone_num_re.match(next_line)
+                        if m_num:
+                            start_pg = int(m_num.group(1))
+                            end_pg = int(m_num.group(2)) if m_num.group(2) else None
+                            _add_range(start_pg, end_pg)
+                            break
+                else:
+                    # Record near miss for debug output
+                    near_misses.append(f"  norm='{norm_line}' | stripped='{norm_line_stripped}' | want='{norm_fund}'")
+
+    if not found_pages and near_misses:
+        console.print("[dim]  [Tier 1 debug] Lines containing fund words but not matching exactly:[/dim]")
+        for nm in near_misses[:8]:
+            console.print(f"[dim]{nm}[/dim]")
 
     return sorted(found_pages)
 
@@ -469,38 +540,10 @@ def find_fund_pages(
     Tier 3 — Vision fallback (~30 seconds, 1-2 API calls)
     """
     is_large_doc = page_texts and len(page_texts) > INDEX_SCAN_PAGES
-
-    # ── Tier 1: Index/TOC regex lookup (zero API calls) ──────────────────────
-    if page_texts and is_large_doc:
-        console.print(f"[cyan]  ℹ [Tier 1] Scanning Index/TOC for '{fund_name}'...[/cyan]")
-        index_pages = _index_page_lookup(fund_name, page_texts)
-        if index_pages:
-            # Expand: also include immediately following pages that still contain
-            # the fund name, to catch multi-page fund sections the TOC doesn't enumerate.
-            expanded = set(index_pages)
-            for start_p in index_pages:
-                for offset in range(1, 4):          # check up to 3 continuation pages
-                    next_p = start_p + offset
-                    if next_p >= len(page_texts):
-                        break
-                    next_text = page_texts[next_p].lower()
-                    fund_norm = re.sub(r'\s+', ' ', fund_name.lower()).strip()
-                    if fund_norm in next_text:
-                        expanded.add(next_p)
-                    else:
-                        break                       # stop at first page that no longer has the fund
-            expanded_sorted = sorted(expanded)
-            if len(expanded_sorted) > len(index_pages):
-                console.print(
-                    f"[green]  ✔ [Tier 1] Index lookup + continuation: page(s) "
-                    f"{[p + 1 for p in expanded_sorted]} (0 API calls)[/green]"
-                )
-            else:
-                console.print(f"[green]  ✔ [Tier 1] Index lookup found page(s): {[p + 1 for p in expanded_sorted]} (0 API calls)[/green]")
-            return expanded_sorted
-        console.print("[yellow]  ⚠ [Tier 1] Index lookup found nothing — falling back to Tier 2.[/yellow]")
+    candidate_pool: set[int] = set()
 
     # ── Build candidate list from text pre-filter ─────────────────────────────
+    # First, find any pages anywhere in the document that contain the fund's name.
     text_matched_pages: set[int] = set()
     if page_texts:
         fund_normalized = re.sub(r'\s+', ' ', fund_name.lower()).strip()
@@ -511,24 +554,57 @@ def find_fund_pages(
 
     if text_matched_pages:
         console.print(f"[cyan]  ℹ Text-layer pre-match: {len(text_matched_pages)} page(s) contain the fund name.[/cyan]")
+        # For large docs, ignore matches inside the Index/TOC pages for the candidate pool itself
+        candidate_pool.update(
+            idx for idx in text_matched_pages
+            if not is_large_doc or idx >= INDEX_SCAN_PAGES
+        )
 
-    candidate_indices = sorted(
-        idx for idx in text_matched_pages
-        if not is_large_doc or idx >= INDEX_SCAN_PAGES
-    ) if text_matched_pages else list(range(INDEX_SCAN_PAGES if is_large_doc else 0, len(page_texts) if page_texts else 1))
+    # ── Tier 1: Index/TOC regex lookup (zero API calls) ──────────────────────
+    tier1_expanded: list[int] = []
+    if page_texts and is_large_doc:
+        console.print(f"[cyan]  ℹ [Tier 1] Scanning Index/TOC for '{fund_name}'...[/cyan]")
+        index_pages = _index_page_lookup(fund_name, page_texts)
+        if index_pages:
+            # Expand to catch multi-page sections the TOC doesn't explicitly number
+            expanded = set(index_pages)
+            for start_p in index_pages:
+                for offset in range(1, 4):
+                    next_p = start_p + offset
+                    if next_p >= len(page_texts):
+                        break
+                    next_text = page_texts[next_p].lower()
+                    fund_norm = re.sub(r'\s+', ' ', fund_name.lower()).strip()
+                    if fund_norm in next_text:
+                        expanded.add(next_p)
+                    else:
+                        break
+            tier1_expanded = sorted(expanded)
+            console.print(f"[cyan]  ℹ [Tier 1] Index lookup points to page(s): {[p + 1 for p in tier1_expanded]}[/cyan]")
+            # Add these to the candidate pool for verification
+            candidate_pool.update(tier1_expanded)
+        else:
+            console.print("[dim]  ℹ [Tier 1] Index lookup found no explicit page number.[/dim]")
+
+    candidate_indices = sorted(candidate_pool)
+    if not candidate_indices:
+        candidate_indices = list(range(INDEX_SCAN_PAGES if is_large_doc else 0, len(page_texts) if page_texts else 1))
 
     if len(candidate_indices) > 40:
         console.print(f"[yellow]  ⚠ {len(candidate_indices)} candidates — capping at 40 for speed.[/yellow]")
-        candidate_indices = candidate_indices[:40]
+        # Keep Tier 1 pages prioritize, cap the rest
+        priority = [p for p in candidate_indices if p in tier1_expanded]
+        others = [p for p in candidate_indices if p not in tier1_expanded]
+        candidate_indices = sorted((priority + others)[:40])
 
-    # ── Tier 2: Text-only gpt-4o-mini lookup (1 API call, no images) ─────────
+    # ── Tier 2: Text-only gpt-4o-mini verification (1 API call) ──────────────
     if page_texts:
-        console.print(f"[cyan]  ℹ [Tier 2] Text-only gpt-4o-mini scan on {len(candidate_indices)} candidate page(s)...[/cyan]")
+        console.print(f"[yellow]  ⟳ [Tier 2] Text-only GPT verification on {len(candidate_indices)} candidate page(s)...[/yellow]")
         tier2_pages = _text_only_gpt_lookup(client, fund_name, candidate_indices, page_texts)
         if tier2_pages:
-            console.print(f"[green]  ✔ [Tier 2] Text-only lookup found page(s): {[p + 1 for p in tier2_pages]}[/green]")
+            console.print(f"[green]  ✔ [Tier 2] Verified dedicated fact sheet on page(s): {[p + 1 for p in tier2_pages]}[/green]")
             return tier2_pages
-        console.print("[yellow]  ⚠ [Tier 2] Text-only GPT found nothing — falling back to Tier 3 vision.[/yellow]")
+        console.print("[yellow]  ⚠ [Tier 2] Text-only GPT rejected candidates — falling back to Tier 3 vision.[/yellow]")
 
     # ── Tier 3: Vision fallback (images, ONLY on narrowed candidates) ─────────
     vision_targets = candidate_indices if candidate_indices else list(range(len(page_texts) if page_texts else 1))
@@ -630,7 +706,12 @@ def extract_fund_details(
         "numbers from the image against the embedded text. If they differ, prefer the embedded text. "
         "Rule #4: The document format will vary by AMC and by month — do not assume any fixed layout. "
         "Discover all sections dynamically from whatever is present. "
-        "Rule #5: Output well-structured Markdown. Do not add commentary or disclaimers."
+        "Rule #5: Output well-structured Markdown. Do not add commentary or disclaimers. "
+        "Rule #6: For legal/regulatory fields — especially Exit Load, Investment Objective, and Lock-in — "
+        "copy the COMPLETE text VERBATIM, word-for-word, from the EMBEDDED PDF TEXT. "
+        "Do NOT paraphrase, shorten, summarise, or rephrase even a single word. "
+        "Every clause, bracket, date, and qualifier (e.g. '(the Limit)', '(w.e.f. April 28, 2021)', "
+        "'purchased or switched in from another scheme of the Fund') MUST be preserved exactly as printed."
     )
 
     extraction_prompt = f"""Extract ALL data for fund: **{fund_name}** from the pages provided.
@@ -643,26 +724,47 @@ STRICT RULES:
 - Do NOT infer fund type, category, or any field — read it from the page or mark it as Not available.
 - Preserve exact numbers: NAV, AUM, returns, percentages — copy them exactly as printed.
 - Discover sections dynamically — every fact sheet has different sections; extract whatever IS shown.
+- VERBATIM RULE: For Exit Load, Investment Objective, and Lock-in period — copy ALL conditions
+  WORD-FOR-WORD from the EMBEDDED PDF TEXT. Do NOT paraphrase, shorten, or summarise.
+  Every clause, bracket, date, and qualifier must be preserved exactly as printed in the source.
 
 ---
 
 # {fund_name}
 
 ## Benchmark Index
-State the benchmark index name(s) used for this fund.
+Extract EVERY benchmark index listed for this fund. Many funds show more than one:
+- **Primary Benchmark** (also labelled "Benchmark", "Scheme Benchmark", "Benchmark Index")
+- **Additional Benchmark** (also labelled "Additional Benchmark Index", "Secondary Benchmark")
+- Any other benchmark index present
+
+List each on its own line with its exact label as printed in the PDF. Example:
+- **Benchmark:** Nifty 500 Multicap 50:25:25 TRI
+- **Additional Benchmark:** Nifty 50 TRI
+
+If only one benchmark is present, list it. If none, write `Not available`.
 
 ## Portfolio Details
 Include all of the following that are present:
 - Fund Manager(s) and managing-since date
 - Fund category / type
-- Investment objective (brief summary)
-- AUM (Assets Under Management)
+- Investment objective (brief summary, verbatim from PDF)
+- AUM — extract EVERY AUM figure present. Different AMCs use different labels; capture all of them:
+  - Month End AUM (also labelled "AUM", "Corpus", "Fund Size")
+  - Average AUM / AAUM (also labelled "Avg. AUM", "Monthly Avg. AUM", "Average Monthly AUM")
+  - If only one AUM figure exists, record it with its exact label as printed.
+  - Format each on its own line using the exact label from the PDF, e.g.:
+    - **Month End AUM:** ₹12,345.67 Cr (as on March 31, 2025)
+    - **Avg. AUM (AAUM):** ₹11,980.45 Cr
 - NAV (with date if shown)
 - Launch / Inception date
-- Exit load
+- Exit load — ⚠ COPY VERBATIM, WORD-FOR-WORD from the embedded PDF text.
+  Do NOT paraphrase or shorten. Every condition, bracket, date (e.g. w.e.f. dates),
+  and qualifier must be reproduced exactly as printed. Include the header line too
+  (e.g. "Exit load for Redemption / Switch out :- Lumpsum & SIP / STP / SWP").
 - Expense ratio (regular and/or direct plan)
 - Minimum investment / SIP amount
-- Lock-in period (if any)
+- Lock-in period (if any) — copy verbatim
 - Any other portfolio metadata visible
 
 ## Quantitative Indicators
@@ -678,25 +780,38 @@ Include rows for the fund and its benchmark(s).
 Include both Absolute and CAGR figures if shown separately.
 
 ## Top 5 Stock Holdings
+Identify ALL individual equity holdings and their % of Portfolio from the pages.
+You MUST MATHEMATICALLY SORT these by the numeric % value in strict DESCENDING order (largest number first).
+Then, output ONLY the top 5 highest allocations as a Markdown table:
 | Stock Name | Sector | % of Portfolio |
-For each of the top 5 equity holdings visible.
+|---|---|---|
+WARNING: Do not just list them in the order they appear on the page. You MUST mathematically rank them so row 1 has the absolute highest % value, row 2 the second highest, and so on. Ensure stock and sector names correspond correctly.
 
 ## Top 5 Sector Holdings
+Identify ALL sector allocations and their % of Portfolio from the pages.
+You MUST MATHEMATICALLY SORT these by the numeric % value in strict DESCENDING order (largest number first).
+Then, output ONLY the top 5 highest allocations as a Markdown table:
 | Sector | % of Portfolio |
-For each of the top 5 sector allocations visible.
+|---|---|
+WARNING: Do not just list them in the order they appear on the page. You MUST mathematically rank them so row 1 has the absolute highest % value, row 2 the second highest, and so on.
 
 ## Group Exposure
 List group-level exposure data if shown (e.g., Tata Group, Adani Group).
 If not shown, write "Not available".
 
 ## Rating Profile
-List credit/rating breakdown (e.g., AAA, AA, Sovereign, Cash & Equivalents) with % weights.
-If this is an equity fund with no rating data, write "Not applicable – equity fund".
+List the credit/rating breakdown (e.g., AAA, AA, Sovereign, Cash & Equivalents) with % weights.
+IMPORTANT: This data is frequently presented visually as a PIE CHART or graph or sometime text. 
+If it is a pie chart, use your vision capabilities to accurately match the chart legend (colors/labels) to the percentages written around or on the slices. Extract every slice category and its exact percentage. Include them as a Markdown table:
+| Rating Class | % of Portfolio |
+|---|---|
+If this is a pure equity fund with no rating data or chart present, write "Not applicable – equity fund".
 
 Note:
 - If a section's data is absent, write "Not available".
 - Never invent or assume values — only extract what is explicitly shown.
 - For tables, use proper Markdown table syntax.
+- For Top 5 Sector Holdings and Top 5 Sector Holdings must be sorted by % of Portfolio in DESCENDING order
 """
 
     # If many target pages, process in batches and concatenate
