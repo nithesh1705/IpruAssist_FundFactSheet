@@ -120,7 +120,7 @@ def main():
     # ── Step 6: Extract detailed data and save Markdown ───────────────────────
     console.print(f"\n[yellow]⟳ Extracting detailed data for '{selected_fund}'...[/yellow]")
     try:
-        markdown_content = extract_fund_details(client, file_path, selected_fund, page_texts)
+        markdown_content, used_pages = extract_fund_details(client, file_path, selected_fund, page_texts)
     except Exception as e:
         console.print(f"[bold red]✗  Failed to extract fund details:[/bold red] {e}")
         sys.exit(1)

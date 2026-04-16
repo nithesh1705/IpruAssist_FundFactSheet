@@ -672,7 +672,7 @@ def extract_fund_details(
     file_path: str,
     fund_name: str,
     page_texts: list[str] | None = None
-) -> str:
+) -> tuple[str, list[int]]:
     """
     High-accuracy two-pass extraction:
       Pass 1 — locate pages containing this fund's data (using text-layer + vision).
@@ -815,11 +815,12 @@ Note:
 """
 
     # If many target pages, process in batches and concatenate
+    extracted_page_nums = [i + 1 for i in target_indices]
     if len(target_images) <= BATCH_SIZE:
         user_content = _build_image_content(target_images, page_texts, target_indices)
         user_content.insert(0, {"type": "text", "text": extraction_prompt})
         result = _call_gpt(client, system_prompt, user_content, max_tokens=8192)
-        return result
+        return result, extracted_page_nums
     else:
         # Multi-batch: extract per sub-batch, then merge with GPT
         console.print(f"[yellow]  ℹ Many pages ({len(target_images)}), extracting in sub-batches...[/yellow]")
@@ -859,10 +860,10 @@ Note:
                     time.sleep(BATCH_DELAY)
 
         if not batch_results:
-            return "# Extraction Failed\n\nAll sub-batches failed. Please try again."
+            return "# Extraction Failed\n\nAll sub-batches failed. Please try again.", extracted_page_nums
 
         if len(batch_results) == 1:
-            return batch_results[0]
+            return batch_results[0], extracted_page_nums
 
         # Merge sub-batch results with GPT
         console.print("[yellow]  ⟳ Merging sub-batch results...[/yellow]")
@@ -877,4 +878,4 @@ Note:
             + "\n\n---BATCH SEPARATOR---\n\n".join(batch_results)
         )
         merge_content = [{"type": "text", "text": merge_prompt}]
-        return _call_gpt(client, system_prompt, merge_content, max_tokens=8192)
+        return _call_gpt(client, system_prompt, merge_content, max_tokens=8192), extracted_page_nums
