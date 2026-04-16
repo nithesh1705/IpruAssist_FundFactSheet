@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
 import axios from 'axios';
-import { UploadCloud, Sun, Moon, FileText, ChevronDown, Download, Loader2 } from 'lucide-react';
+import { UploadCloud, Sun, Moon, FileText, ChevronDown, Download, Copy, Check, Loader2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
@@ -15,6 +15,8 @@ export default function App() {
   const [processing, setProcessing] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
+  const [copied, setCopied] = useState(false);
+  const [downloading, setDownloading] = useState(false);
 
   const fileInputRef = useRef(null);
   
@@ -108,9 +110,42 @@ export default function App() {
     }
   };
 
-  const handleDownload = () => {
-    if (!result?.word_filename) return;
-    window.open(`http://localhost:8000/download/${result.word_filename}`, '_blank');
+  const handleDownload = async () => {
+    if (!result?.markdown_content) return;
+    try {
+      setDownloading(true);
+      setError('');
+      const response = await axios.post(
+        'http://localhost:8000/download-word',
+        { markdown_content: result.markdown_content, fund_name: selectedFund },
+        { responseType: 'blob' }
+      );
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', `${selectedFund.replace(/[^a-zA-Z0-9]/g, '_')}_Factsheet.docx`);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Word download failed:', err);
+      setError('Failed to generate Word document. Please try again.');
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  const handleCopy = async () => {
+    if (!result?.markdown_content) return;
+    try {
+      await navigator.clipboard.writeText(result.markdown_content);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    } catch (err) {
+      console.error('Copy failed:', err);
+      setError('Failed to copy content to clipboard.');
+    }
   };
 
   return (
@@ -134,7 +169,7 @@ export default function App() {
         </div>
       </header>
 
-      <main className="container mx-auto px-6 py-12 max-w-4xl space-y-8">
+      <main className="container mx-auto px-6 py-12 max-w-5xl space-y-8">
         
         {/* Upload Section */}
         <section className="bg-card border border-border rounded-xl p-8 shadow-sm">
@@ -224,18 +259,32 @@ export default function App() {
           <section className="bg-card border border-border rounded-xl shadow-sm overflow-hidden flex flex-col flex-1 animate-in slide-in-from-bottom-4 fade-in duration-500">
             <div className="flex items-center justify-between border-b border-border px-6 py-4 bg-secondary/30">
               <h2 className="text-lg font-semibold">Extracted Content</h2>
-              {result.word_filename && (
+              <div className="flex items-center gap-3">
+                <button 
+                  onClick={handleCopy}
+                  className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground font-medium rounded-md hover:bg-primary/90 transition-colors shadow-sm text-sm"
+                >
+                  {copied ? (
+                    <><Check className="w-4 h-4" />Copied!</>
+                  ) : (
+                    <><Copy className="w-4 h-4" />Copy Content</>
+                  )}
+                </button>
                 <button 
                   onClick={handleDownload}
-                  className="flex items-center gap-2 px-4 py-2 bg-accent text-accent-foreground font-medium rounded-md hover:bg-accent/80 transition-colors border border-border shadow-sm text-sm"
+                  disabled={downloading}
+                  className="flex items-center gap-2 px-4 py-2 bg-accent text-accent-foreground font-medium rounded-md hover:bg-accent/80 transition-colors border border-border shadow-sm text-sm disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  <Download className="w-4 h-4" />
-                  Download Word Document
+                  {downloading ? (
+                    <><Loader2 className="w-4 h-4 animate-spin" />Generating...</>
+                  ) : (
+                    <><Download className="w-4 h-4" />Download Word</>
+                  )}
                 </button>
-              )}
+              </div>
             </div>
             <div className="p-6 bg-background">
-              <div className="prose prose-sm dark:prose-invert max-w-none text-foreground prose-headings:text-foreground prose-p:text-foreground prose-strong:text-foreground prose-a:text-primary mb-8 border-b border-border pb-8">
+              <div id="extracted-content-pdf" className="prose prose-base dark:prose-invert max-w-none text-foreground prose-headings:text-foreground prose-p:text-foreground prose-strong:text-foreground prose-a:text-primary mb-8 border-b border-border p-6 rounded-md">
                 <ReactMarkdown remarkPlugins={[remarkGfm]}>
                   {result.markdown_content}
                 </ReactMarkdown>

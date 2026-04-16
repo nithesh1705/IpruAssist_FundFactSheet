@@ -732,6 +732,13 @@ STRICT RULES:
 
 # {fund_name}
 
+## Description
+Extract the short description or tagline that appears directly below the fund name on the fact sheet.
+This is typically a one-line summary of the fund's investment mandate, for example:
+  "An open ended dynamic equity scheme investing across large cap, mid cap & small cap stocks"
+  "An open-ended Equity Scheme investing in companies following ESG theme with exclusionary strategy"
+Copy it VERBATIM, exactly as printed. If no description is present below the fund name, write `Not available`.
+
 ## Benchmark Index
 Extract EVERY benchmark index listed for this fund. Many funds show more than one:
 - **Primary Benchmark** (also labelled "Benchmark", "Scheme Benchmark", "Benchmark Index")
@@ -806,6 +813,14 @@ If it is a pie chart, use your vision capabilities to accurately match the chart
 | Rating Class | % of Portfolio |
 |---|---|
 If this is a pure equity fund with no rating data or chart present, write "Not applicable – equity fund".
+
+## Suitable For Investors
+Extract the bullet points listed under the section labelled "This product is suitable for investors who are seeking^:" (or any equivalent heading such as "This product is suitable for investors who are seeking:").
+This section is almost always found near the Riskometer / product labelling box on the fund's fact sheet page.
+- Copy EVERY bullet point VERBATIM, word-for-word, exactly as printed.
+- List each bullet as a separate Markdown bullet point (- item).
+- Do NOT paraphrase, merge, or shorten any point.
+- If this section is not present on these pages, write "Not available".
 
 Note:
 - If a section's data is absent, write "Not available".
