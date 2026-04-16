@@ -190,7 +190,7 @@ def extract_fund_names(
     is_large_doc = bool(page_texts and len(page_texts) > SEARCH_LIMIT)
 
     if is_large_doc:
-        console.print(f"[cyan]  ℹ Large document detected ({len(page_texts)} pages). Scanning only the first {SEARCH_LIMIT} pages (Index/TOC) to find fund names.[/cyan]")
+        console.print(f"[cyan]  ℹ  Large document detected ({len(page_texts)} pages). Scanning only the first {SEARCH_LIMIT} pages (Index/TOC) to find fund names.[/cyan]")
 
     # ── Prompts ───────────────────────────────────────────────────────────────
     # TOC/Index prompt — used for large docs scanning the index pages.

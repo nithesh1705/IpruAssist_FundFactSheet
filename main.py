@@ -84,15 +84,15 @@ def main():
         console.print(f"[bold red]✗ Invalid input:[/bold red] '{file_path}' is not a valid PDF file.")
         sys.exit(1)
 
-    console.print(f"\n[green]✔ PDF validated:[/green] {file_path}")
+    console.print(f"\n[green]✔  PDF validated:[/green] {file_path}")
     filename_stem = get_pdf_filename_stem(file_path)
 
     # ── Step 3: Extract text layer ────────────────
-    console.print("\n[yellow]⟳ Extracting embedded text layer...[/yellow]", end=" ")
+    console.print("\n[yellow]⟳ Extracting text layer...[/yellow]", end=" ")
     page_texts = get_pdf_page_texts(file_path)
     text_pages_count = sum(1 for t in page_texts if t.strip())
     console.print(
-        f"[green]{text_pages_count}/{len(page_texts)} page(s) have embedded text "
+        f"[green]{text_pages_count}/{len(page_texts)} page(s) have extracted text "
         f"(used as primary accuracy source).[/green]"
     )
 
@@ -111,18 +111,18 @@ def main():
         console.print("[bold red]✗ No fund names could be identified in this document.[/bold red]")
         sys.exit(1)
 
-    console.print(f"[green]✔ Found {len(fund_names)} fund(s).[/green]")
+    console.print(f"\n[green]✔  Found {len(fund_names)} fund(s).[/green]")
 
     # ── Step 5: User selects a fund ───────────────────────────────────────────
     selected_fund = select_fund(fund_names)
-    console.print(f"\n[bold green]✔ Selected:[/bold green] {selected_fund}")
+    console.print(f"\n[bold green]✔  Selected:[/bold green] {selected_fund}")
 
     # ── Step 6: Extract detailed data and save Markdown ───────────────────────
     console.print(f"\n[yellow]⟳ Extracting detailed data for '{selected_fund}'...[/yellow]")
     try:
         markdown_content = extract_fund_details(client, file_path, selected_fund, page_texts)
     except Exception as e:
-        console.print(f"[bold red]✗ Failed to extract fund details:[/bold red] {e}")
+        console.print(f"[bold red]✗  Failed to extract fund details:[/bold red] {e}")
         sys.exit(1)
 
     safe_fund_name = selected_fund.replace(" ", "_")
